@@ -1,0 +1,437 @@
+﻿<?xml version="1.0" encoding="utf-8"?>
+<TcPlcObject Version="1.1.0.1" ProductVersion="3.1.4024.9">
+  <POU Name="FB_WeighScale" Id="{52221397-8f3a-4640-bfdf-da32cd56a1e5}" SpecialFunc="None">
+    <Declaration><![CDATA[FUNCTION_BLOCK FB_WeighScale
+VAR_INPUT
+	sRmtSrvIpAddr	: T_IPv4Addr; // Remote TCP/IP Server Address
+	nRmtSrvPort		: UDINT; // Remote TCP/IP Server Port
+	sInstantCmdStr	: T_MaxString := ''; // Single Shot Command to Server
+	sPollCmdStr		: T_MaxString; // Polling Command to Server
+	bReset			: BOOL; // Reset if Error; Closes Specific Socket
+END_VAR
+VAR_OUTPUT
+	sOutStr			: T_MaxString; // Output String
+	bError			: BOOL := FALSE; // Error occurred in TCP/IP Comms
+END_VAR
+VAR
+	
+	fbClientServerConnect 	: FB_ClientServerConnection; // FB for connection with TCP/IP server
+	fbSocketSend 			: FB_SocketSend;	// FB to send request command data to server
+	fbSocketReceive 		: FB_SocketReceive;	// FB to send request for receive data from server
+	fbSocketCloseAll 		: FB_SocketCloseAll; // FB to close all connections on restart
+	fbPollTON				: TON;
+	
+	arrReceiveBuffer	: ARRAY [0..MAX_STRING_LENGTH] OF BYTE; // Buffer of received data from request; may take multiple cycles
+	
+	sFromServer 		: T_MaxString 	:= ''; // Response string from server
+	sErrorStep 			: T_MaxString 	:= ''; // Case step the error occurred in
+	
+	sCmdStr				: T_MaxString; // Request Command sent to Server
+	sPrevInstCmdStr		: T_MaxString := ''; // Previous Instant Command String
+	sCtrlChar			: STRING(3) := '$R'; // ASCII String Constant of Ctrl Char
+	
+	nCtrlChar 			: BYTE := 13; // Decimal Equivalent of CtrlChar
+	nBytesReceived 		: UDINT := 0;
+	nStartPos 			: UDINT := 0;
+	nEndPos 			: UDINT := 0;
+	nIdx 				: UDINT := 0;
+	nFrame 				: UDINT := 0;
+	
+	nTransferStep : INT := 0;
+	
+	bSocketCloseAllTrig : BOOL := TRUE; // Trigger to Close All Sockets
+	bGetStartInstCmd	: BOOL := TRUE; // Used on Start-Up to Get First Instant Cmd
+END_VAR
+]]></Declaration>
+    <Implementation>
+      <ST><![CDATA[(*
+	FB_WeighScale:
+		This Function Block is used to execute TCP/IP Client-Side comms with a remote 
+		TCP/IP Server. This FB handles the establishment of connection with the remote 
+		TCP/IP server, as well as a state machine for stepping through sending Commands 
+		to the TCP/IP Server, and receiving Responses from the TCP/IP Server.
+		
+		After establishment of remote TCP/IP server connection, the high level operation of
+		this FB is such that:
+		 	1 - FB accepts a new command
+			2 - FB prepares command
+			3 - FB sends command to server
+			4 - FB receives response
+			5 - FB grooms the byte array result
+			6 - If the command sent has NOT changed since last full cycle of 
+				the CASE state machine, the FB will start polling a default command 
+				whose interval is set by the PT of the polling TON.
+				
+			The reason why we poll is that this initial FB was set up for a weighing 
+			transmitter. So while there may be occassions the operator TARE the weigh
+			module via the HMI, most of the time we simply want to poll the weigh module
+			to retrieve the current weight. 
+			
+		DEPENDENCIES:
+			TF6410 => Tc2_Tcpip Library (Ver. 3.3.6.0 used by developer)
+
+		NOTES:
+			1 - This specific instance of the FB has been developed to communicate 
+			with the TCP/IP Server of a Rice Lake 680 Synergy Plus weighing module. 
+			In theory, this FB can be used to execute other Client-Side comms with a
+			remote TCP/IP Server. The idea is that one would simply alter the array
+			elements of arrCommandStr for the specific commands that need to be
+			sent based on your device documentation.
+			
+			2 - The $ character within a string is interpreted by TwinCAT as a keyword
+			indicating that the next two characters following the $ are to be interpreted
+			as their hexadecimal equivalent according to Windows 1252 coding; 
+			e.g. '$41' == A
+			
+			3 - The input to TCP/IP Function Blocks 'sSrvNetId' is the AMS Net ID of 
+			the machine running the TwinCAT TCP/IP Server, NOT the remote TCP/IP Server
+			IP address.
+			
+			4 - Max string command to TCP/IP server is SIZE T_MAXSTRING - 3 (i.e.
+			length of sCtrlChar)
+			
+			5 - Tested with Contrl Character delimiter as Carriage Return == decimal 13
+			
+		***************	
+		****WARNING****
+		***************
+		**	Attempts have been made to prevent array overflows from receiving
+		**	more data than there exists array indices. However, the programmer should
+		**	be mindful of the maximum byte data expected to be returned from
+		**	a single client side request and properly size the respective
+		**	buffer arrays.
+		
+	Author: Adam Haney, Mora Technologies; 31DEC2021.
+	Tested SAT:
+	Revision: 0.0.
+*)
+
+// Call Method responsible for TCP/IP Communication
+mTcpComms();
+
+// Call Method for Parsing String from Server
+mParseResponse(sInputStr := sFromServer, 
+				sOutputstr => sOutStr);
+
+
+
+
+
+]]></ST>
+    </Implementation>
+    <Method Name="mParseResponse" Id="{c10814c0-0df4-4caf-8c65-ad311a9ac635}">
+      <Declaration><![CDATA[METHOD mParseResponse : BOOL
+VAR_INPUT
+	sInputStr	: T_MaxString;
+END_VAR
+
+VAR
+	nIdxIn		: INT := 0;
+	nIdxOut		: INT := 0;
+	arrByteIn	: ARRAY [0..MAX_STRING_LENGTH] OF BYTE := [256(0)];
+	arrByteOut	: ARRAY [0..MAX_STRING_LENGTH] OF BYTE := [256(0)];
+END_VAR
+
+VAR_OUTPUT
+	sOutputstr	: T_MaxString;
+END_VAR
+]]></Declaration>
+      <Implementation>
+        <ST><![CDATA[(*
+	mParseResponse:
+		This Method simply iterates over the string returned from the server
+		and passes any value in the server string >= ASCII value 48 AND <= ASCII 
+		value 57 to the sOutputStr. 
+		
+		In this manner, we can get the numeric value of the weight on the scale.
+		This solution is specific to the weigh scale we are using. 
+		
+	Author: Adam Haney, Mora Technologies; 4JAN2022.
+	Tested SAT:
+	Revision: 0.0
+*)
+
+// Copy input string to byte array
+arrByteIn := MAXSTRING_TO_BYTEARR(in := sInputStr);
+
+// Iterate over byte array
+FOR nIdxIn := 0 TO (SIZEOF(arrByteIn) - 1) BY 1 DO
+	IF arrByteIn[nIdxIn] >= 48 AND arrByteIn[nIdxIn] <= 57 THEN
+		arrByteOut[nIdxOut] := arrByteIn[nIdxIn];
+		nIdxOut := nIdxOut + 1;
+	END_IF
+END_FOR
+
+// Convert Out Byte Array to Out String
+sOutputstr := BYTEARR_TO_MAXSTRING(in := arrByteOut);]]></ST>
+      </Implementation>
+    </Method>
+    <Method Name="mTcpComms" Id="{dc841a53-4f86-4834-b0c2-8382c79f8ac4}">
+      <Declaration><![CDATA[METHOD mTcpComms : BOOL
+VAR_INPUT
+END_VAR
+]]></Declaration>
+      <Implementation>
+        <ST><![CDATA[(*
+	mTcpComms:
+		This Method encapsulates the functionality of:
+			- Creating a TCP/IP connection with remote server
+			- Sending commands to remote server
+			- Receiving responses from remote server
+			- Reseting socket connection in case of error
+	
+	Author: Adam Haney, Mora Technologies; 4JAN2021.
+	Tested SAT:
+	Revision: 0.0.
+*)
+
+// Initialize Polling TON
+fbPollTON.PT := T#2S;
+
+// Get first INSTANT command on PLC Start
+IF bGetStartInstCmd THEN
+	bGetStartInstCmd := FALSE;
+	sPrevInstCmdStr := sInstantCmdStr;
+END_IF
+
+// On PLC restart or any event that re-initializes FB_WeighScale,
+// close all Socket Connections
+fbSocketCloseAll(sSrvNetId := '',
+					bExecute := bSocketCloseAllTrig,
+					tTimeout := T#5S);
+
+IF fbSocketCloseAll.bBusy THEN
+	RETURN;
+ELSIF NOT fbSocketCloseAll.bBusy AND NOT fbSocketCloseAll.bError THEN 
+	bSocketCloseAllTrig := FALSE;
+END_IF
+
+
+// Determine if TCP/IP Comms in Error State
+IF nTransferStep = 200 THEN
+	bError := TRUE;
+ELSE
+	bError := FALSE;
+END_IF
+
+// Determine if a NEW instant command has been input to the Function Block
+// or if we should use the POLLING command
+IF sPrevInstCmdStr <> sInstantCmdStr THEN
+	sPrevInstCmdStr := sInstantCmdStr;
+	sCmdStr := sInstantCmdStr;
+ELSE
+	sCmdStr := sPollCmdStr;
+END_IF
+
+
+// Prepare sCmdStr with Delimiter String
+sCmdStr	:= CONCAT(STR1 := sCmdStr, STR2 := sCtrlChar);
+
+CASE nTransferStep OF 
+		
+	0: 
+		// ESTABLISH CONNECTION
+	
+		fbClientServerConnect(sSrvNetID := '',
+								nMode := 0,
+								sRemoteHost := sRmtSrvIpAddr,
+								nRemotePort := nRmtSrvPort,
+								bEnable := TRUE,
+								tReconnect := T#1M);
+			
+		IF fbClientServerConnect.eState = eSOCKET_CONNECTED THEN
+			nTransferStep := 10;
+		
+		ELSIF fbClientServerConnect.bError THEN
+			sErrorStep := '0 - fbClientServerConnect Error';
+			nTransferStep := 200;
+		END_IF
+	
+		
+	10:
+		// BEGIN COMMAND SEND: Send data request with parameters to TCP/IP server
+			
+		fbSocketSend(sSrvNetID := '',
+				hSocket := fbClientServerConnect.hSocket,
+				cbLen := INT_TO_UDINT(LEN(sCmdStr)), 
+				pSrc := ADR(sCmdStr),
+				bExecute := TRUE,
+				tTimeout := T#10S);
+			
+		// State transition => 20
+		// If busy, we know FB is activated	
+		IF fbSocketSend.bBusy AND NOT fbsocketsend.bError THEN
+			nTransferStep := 20;
+			
+		ELSIF fbSocketSend.bError THEN
+			fbSocketSend(bExecute := FALSE);
+			sErrorStep := '10 - Socket Send Error';
+			nTransferStep := 200;
+		END_IF
+	
+		
+	20:
+		// CONFIRM COMMAND SENT	
+		fbSocketSend();
+		
+		// If no longer busy, we know we have properly sent command
+		IF NOT fbSocketSend.bBusy AND NOT fbSocketSend.bError THEN
+			fbSocketSend(bExecute := FALSE);
+			nTransferStep := 30;
+		
+		ELSIF fbSocketSend.bError THEN
+			sErrorStep := '20 - Socket Send Error';
+			nTransferStep := 200;
+		END_IF
+		
+		
+	30:
+		// RECEIVE START: Send the data receive request to server
+		
+		IF nBytesReceived >= (SIZEOF(arrReceiveBuffer) - 1) THEN
+			sErrorStep := '30 - Data received overrun or no reset nBytesReceived';
+			nTransferStep := 200;
+			RETURN;
+		END_IF
+		
+		fbSocketReceive(sSrvNetId := '',
+					hSocket := fbClientServerConnect.hSocket,
+					cbLen := SIZEOF(arrReceiveBuffer) - nBytesReceived,
+					pDest := ADR(arrReceiveBuffer) + nBytesReceived,
+					tTimeout := T#10S,
+					bExecute := TRUE);
+					
+		// State Transition => 30
+		// If FB is busy, we know we have activated FB
+		IF fbSocketReceive.bBusy AND NOT fbSocketReceive.bError THEN
+			nTransferStep := 40;
+			
+		ELSIF fbSocketReceive.bError THEN
+			fbSocketReceive(bExecute := FALSE);
+			sErrorStep := '30 - fbSocketReceive Error';
+			nTransferStep := 200;
+		END_IF
+		
+		
+	40:
+		// CONFIRM RECEIVE ACTIVATED
+		fbSocketReceive();
+		
+		// If no longer busy, we know FB has executed command
+		IF NOT fbSocketReceive.bBusy AND NOT fbSocketReceive.bError THEN
+			fbSocketReceive(bExecute := FALSE);
+			nTransferStep := 50;
+		
+		ELSIF fbSocketReceive.bError THEN
+			fbSocketReceive(bExecute := FALSE);
+			sErrorStep := '40 - fbSocketReceive Error';
+			nTransferStep := 200;
+		END_IF
+	
+	50:
+		// RECEIVE WAIT: 
+		// TCP/IP data can be fragmented (i.e. the data payload may span multiple 
+		// packets). This requires that we continually call the FB_SocketReceive FB
+		// until we find out Control Character delimiting the response stream, or 
+		// until we have received data that is in excess of our receive buffer.
+		
+		IF (fbSocketReceive.nRecBytes > 0 ) THEN
+			nstartPos := nBytesReceived; (* Receive buffer start pos for data bytes *)
+			nEndPos := nBytesReceived + fbSocketReceive.nRecBytes - 1; (* Receiver buffer end index after last data byte *)
+			nBytesReceived := nBytesReceived + fbSocketReceive.nRecBytes; (* Running total of bytes received in receive request *)
+			
+			nFrame := 0; (* Reset frame length *)
+			
+			(* Iterate through received buffer checking for message end delimiter *)
+			FOR nIdx := nStartPos TO nEndPos BY 1 DO
+				// Check that we are within boundaries of receive buffer
+				IF nEndPos > (SIZEOF(arrReceiveBuffer) -  1) THEN
+					sErrorStep := '50 - Receive Buffer Data Overrun';
+					nTransferStep := 200;
+					RETURN;
+				END_IF
+			
+				IF (arrReceiveBuffer[nIdx] = nCtrlChar) THEN 
+					nFrame := nIdx + 1; (* calculate the length of received string inclusive of end delimiter *)
+					MEMCPY(destAddr := ADR(sFromServer), srcAddr := ADR(arrReceiveBuffer), n := nFrame);
+					MEMMOVE(destAddr := ADR(arrReceiveBuffer), srcAddr := ADR(arrReceiveBuffer[nFrame]), n := nBytesReceived - nFrame);
+					nBytesReceived := 0;
+					
+					// If we are here, we have found the ctrl character delimiter
+					// Transition State => 40
+					fbSocketReceive(bExecute := FALSE);
+					nTransferStep := 60;
+				END_IF
+			END_FOR
+			
+		ELSE (* No data present to read - Request receive again *)
+			fbSocketReceive(bExecute := FALSE);
+			nTransferStep := 30;
+		END_IF
+
+		
+	60: 
+		// WAIT BEFORE RESTART CYCLE
+		fbPollTON(IN := TRUE);
+		
+		IF fbPollTON.Q THEN
+			fbPollTON(IN := FALSE);
+			nTransferStep := 0;
+		END_IF
+		
+		
+		// Error State
+	200:
+		IF bReset THEN
+			// Close Connection
+			fbClientServerConnect(bEnable := FALSE);
+			
+			fbSocketSend(bExecute := FALSE);
+			fbSocketReceive(bExecute := FALSE);
+			
+			nTransferStep := 0;
+		END_IF
+END_CASE	]]></ST>
+      </Implementation>
+    </Method>
+    <LineIds Name="FB_WeighScale">
+      <LineId Id="816" Count="60" />
+      <LineId Id="1465" Count="0" />
+      <LineId Id="1361" Count="0" />
+      <LineId Id="1082" Count="0" />
+      <LineId Id="1467" Count="2" />
+      <LineId Id="1475" Count="0" />
+      <LineId Id="1470" Count="3" />
+      <LineId Id="1466" Count="0" />
+      <LineId Id="9" Count="0" />
+    </LineIds>
+    <LineIds Name="FB_WeighScale.mParseResponse">
+      <LineId Id="98" Count="20" />
+      <LineId Id="120" Count="0" />
+      <LineId Id="119" Count="0" />
+      <LineId Id="36" Count="0" />
+      <LineId Id="122" Count="2" />
+    </LineIds>
+    <LineIds Name="FB_WeighScale.mTcpComms">
+      <LineId Id="207" Count="0" />
+      <LineId Id="213" Count="0" />
+      <LineId Id="217" Count="0" />
+      <LineId Id="220" Count="3" />
+      <LineId Id="219" Count="0" />
+      <LineId Id="214" Count="0" />
+      <LineId Id="224" Count="1" />
+      <LineId Id="212" Count="0" />
+      <LineId Id="211" Count="0" />
+      <LineId Id="6" Count="13" />
+      <LineId Id="23" Count="5" />
+      <LineId Id="226" Count="1" />
+      <LineId Id="29" Count="0" />
+      <LineId Id="229" Count="1" />
+      <LineId Id="232" Count="1" />
+      <LineId Id="231" Count="0" />
+      <LineId Id="228" Count="0" />
+      <LineId Id="30" Count="176" />
+      <LineId Id="5" Count="0" />
+    </LineIds>
+  </POU>
+</TcPlcObject>
